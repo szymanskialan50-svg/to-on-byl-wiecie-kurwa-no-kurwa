@@ -1,0 +1,249 @@
+name: Build USC-CAM (iOS .ipa + Windows .exe)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # Works no matter how the files were uploaded (repo root or inside a sub-folder),
+      # and recreates project.yml when it is missing.
+      - name: Locate iOS sources / ensure project.yml
+        run: |
+          SWIFT=$(find . -name CameraManager.swift -not -path "./build/*" | head -1)
+          if [ -z "$SWIFT" ]; then
+            echo "CameraManager.swift not found. Repository files:"; find . -not -path "./.git/*" -type f | head -80; exit 1
+          fi
+          IOS_DIR=$(dirname "$SWIFT")
+          ROOT=$(dirname "$IOS_DIR")
+          IOS_NAME=$(basename "$IOS_DIR")
+          echo "iOS sources: $IOS_DIR   project root: $ROOT"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          cd "$ROOT"
+          if [ ! -f project.yml ]; then
+            echo "project.yml missing - creating it"
+            cat > project.yml <<EOF
+          name: USBWebcam
+          options:
+            bundleIdPrefix: com.eni.lo
+          targets:
+            USBWebcam:
+              type: application
+              platform: iOS
+              deploymentTarget: "15.0"
+              sources:
+                - path: $IOS_NAME
+                  excludes: ["Info.plist"]
+              info:
+                path: $IOS_NAME/Info.plist
+                properties:
+                  CFBundleDisplayName: USC-CAM
+                  CFBundleName: USC-CAM
+                  CFBundleShortVersionString: "1.0"
+                  CFBundleVersion: "1"
+                  LSRequiresIPhoneOS: true
+                  NSCameraUsageDescription: "USC-CAM uses the camera to stream high quality video to your PC."
+                  NSMicrophoneUsageDescription: "USC-CAM sends the phone microphone to your PC."
+                  NSBonjourServices: ["_usccam._tcp"]
+                  NSLocalNetworkUsageDescription: "USC-CAM streams the camera to your PC over your local Wi-Fi network."
+                  UILaunchScreen: {}
+                  UIRequiredDeviceCapabilities: [arm64]
+                  UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+                  UIStatusBarStyle: UIStatusBarStyleLightContent
+                  UIViewControllerBasedStatusBarAppearance: true
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.eni.lo.USBWebcam
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+                  CODE_SIGNING_ALLOWED: NO
+                  CODE_SIGNING_REQUIRED: NO
+                  CODE_SIGN_IDENTITY: ""
+                  ENABLE_BITCODE: NO
+          EOF
+          fi
+
+      - name: Generate Xcode project
+        run: |
+          cd "$ROOT"
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build app (unsigned)
+        run: |
+          cd "$ROOT"
+          xcodebuild -project USBWebcam.xcodeproj \
+                     -scheme USBWebcam \
+                     -sdk iphoneos \
+                     -configuration Release \
+                     -destination 'generic/platform=iOS' \
+                     -derivedDataPath build \
+                     CODE_SIGN_IDENTITY="" \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGNING_ALLOWED=NO \
+                     clean build
+
+      - name: Package .ipa
+        run: |
+          cd "$ROOT"
+          APP="build/Build/Products/Release-iphoneos/USBWebcam.app"
+          test -d "$APP" || { echo "App not found"; find build -name "*.app" -maxdepth 6; exit 1; }
+          rm -rf Payload "$GITHUB_WORKSPACE/output"
+          mkdir -p Payload "$GITHUB_WORKSPACE/output"
+          cp -r "$APP" Payload/
+          zip -qry "$GITHUB_WORKSPACE/output/USC-CAM.ipa" Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: output/USC-CAM.ipa
+
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install opencv-python-headless numpy pyqt5 pyvirtualcam av zeroconf pyaudiowpatch pyinstaller
+
+      - name: Locate desktop sources
+        shell: bash
+        run: |
+          MAIN=$(find . -name usbmux.py -not -path "./.git/*" | head -1)
+          if [ -z "$MAIN" ]; then
+            echo "usbmux.py not found. Repository files:"; find . -not -path "./.git/*" -type f | head -80; exit 1
+          fi
+          DESK=$(dirname "$MAIN")
+          test -f "$DESK/main.py" || { echo "main.py missing next to usbmux.py"; exit 1; }
+          echo "Desktop sources: $DESK"
+          echo "DESK=$DESK" >> "$GITHUB_ENV"
+
+      - name: Add camera driver (DirectShow DLL, shows up as "HD Camera iPhone")
+        shell: bash
+        run: |
+          # Only the Install/ folder: the sample project in that repo has paths too long for Windows.
+          git config --global core.longpaths true
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/schellingb/UnityCapture.git uc
+          git -C uc sparse-checkout set Install
+          git -C uc checkout
+          mkdir -p drv
+          # Current UnityCapture releases: Install/UnityCaptureFilter64.dll + ...32.dll
+          # (older ones: ...64bit.dll / ...32bit.dll) - accept both.
+          f64=$(find uc -type f -iname "UnityCaptureFilter64*.dll" -not -path "uc/.git/*" | head -1)
+          f32=$(find uc -type f -iname "UnityCaptureFilter32*.dll" -not -path "uc/.git/*" | head -1)
+          if [ -z "$f64" ] || [ -z "$f32" ]; then
+            echo "Sparse checkout gave no DLLs - downloading them directly"
+            mkdir -p uc/Install
+            for n in UnityCaptureFilter64.dll UnityCaptureFilter32.dll; do
+              curl -fsSL -o "uc/Install/$n" "https://raw.githubusercontent.com/schellingb/UnityCapture/master/Install/$n"
+            done
+            f64=$(find uc -type f -iname "UnityCaptureFilter64*.dll" -not -path "uc/.git/*" | head -1)
+            f32=$(find uc -type f -iname "UnityCaptureFilter32*.dll" -not -path "uc/.git/*" | head -1)
+          fi
+          if [ -z "$f64" ] || [ -z "$f32" ]; then
+            echo "UnityCapture DLLs not found. Repo files:"; find uc -type f -not -path "uc/.git/*" | head -60; exit 1
+          fi
+          cp -v "$f64" drv/HDCameraiPhone64.dll
+          cp -v "$f32" drv/HDCameraiPhone32.dll
+          lic=$(find uc -maxdepth 1 -iname "LICENSE*" | head -1)
+          if [ -n "$lic" ]; then cp "$lic" drv/LICENSE-UnityCapture.txt; fi
+
+      - name: Add face detector model (YuNet, used by "Blur faces")
+        shell: bash
+        run: |
+          # Pinned commit of OpenCV's model zoo (~230 KB). If the download fails the app still builds
+          # and "Blur faces" falls back to the basic detector.
+          curl -fsSL --retry 3 -o yunet.onnx "https://github.com/opencv/opencv_zoo/raw/fd2da740ebc6d0fe489d86cb55133148978cd82e/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" || rm -f yunet.onnx
+          if [ -s yunet.onnx ] && [ "$(wc -c < yunet.onnx)" -gt 100000 ]; then echo "YuNet model OK"; else rm -f yunet.onnx; echo "YuNet model NOT available - basic detector will be used"; fi
+
+      - name: Build single-file EXE
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          YUNET_ARG=""
+          if [ -f yunet.onnx ]; then YUNET_ARG="--add-data=yunet.onnx;."; fi
+          pyinstaller --noconfirm --onefile --windowed $YUNET_ARG \
+            --name "USC-CAM" \
+            --icon "$DESK/icon.ico" \
+            --add-data "$DESK/icon.ico;." \
+            --add-data "drv;driver" \
+            --paths "$DESK" \
+            --collect-all pyvirtualcam \
+            --collect-all av \
+            --collect-all zeroconf \
+            --collect-all pyaudiowpatch \
+            --collect-data cv2 \
+            --hidden-import procs \
+            --hidden-import audio \
+            --hidden-import autosetup \
+            --hidden-import guard \
+            "$DESK/main.py"
+
+      - name: Collect files
+        shell: bash
+        run: |
+          mkdir -p dist/driver
+          cp drv/* dist/driver/
+          cp "$DESK/Uninstall-HD-Camera.bat" dist/
+
+      - name: Upload EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist/USC-CAM.exe
+            dist/driver/
+            dist/Uninstall-HD-Camera.bat
+
+  package-zip:
+    name: Bundle final ZIP
+    needs: [build-ios, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download iOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa
+          path: release/
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release/
+
+      - name: Create ZIP
+        run: |
+          cd release
+          zip -r ../USC-CAM-Package.zip .
+
+      - name: Upload Complete Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: USC-CAM-Package
+          path: USC-CAM-Package.zip
